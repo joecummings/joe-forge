@@ -42,62 +42,8 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.worker.worker_base import WorkerWrapperBase
 
-from forge.actors._torchstore_utils import (
-    extract_param_name,
-    get_dcp_whole_state_dict_key,
-    get_param_key,
-    get_param_prefix,
-    load_tensor_from_dcp,
-)
-
-from forge.controller import ForgeActor, get_proc_mesh, stop_proc_mesh
-from forge.data.sharding import VLLMSharding
-from forge.data_models.completion import Completion
-from forge.data_models.prompt import to_prompt
-from forge.interfaces import Policy as PolicyInterface
-from forge.observability.metrics import record_metric, Reduce
-from forge.observability.perf_tracker import Tracer
-from forge.types import ProcessConfig
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-@dataclass
-class SamplingConfig:
-    """
-    Overrides for vLLMs sampling params.
-
-    Note: We'll want to tie this closer to or directly use vllm's
-            SamplingParams. It is currently used to track a supported
-            subset
-
-    Args:
-        n: Number of samples to generate.
-        guided_decoding: Whether to use guided decoding.
-        max_tokens: Maximum number of tokens to generate.
-    """
-
-    n: int = 1
-    guided_decoding: bool = False
-    max_tokens: int = 512
-    temperature: float = 1.0
-    top_p: float = 1.0
-    logprobs: int = 1
-
-    def __post_init__(self):
-        super().__init__()
-        gd_params = None
-        if self.guided_decoding:
-            gd_params = GuidedDecodingParams(choice=["Positive", "Negative"])
-        self.guided_decoding = gd_params
-
-    @classmethod
-    def from_dict(cls, d: Mapping):
-        d = dict(d)
-        all_fields = set(cls.__dataclass_fields__.keys())
-        valid_args = {k: v for k, v in d.items() if k in all_fields}
-        return cls(**valid_args)
 
 
 @dataclass
@@ -107,7 +53,7 @@ class EngineConfig(EngineArgs):
     Overlapping keys in input dict will override EngineArgs defaults.
     """
 
-    model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model: str
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     enforce_eager: bool = False
@@ -133,12 +79,9 @@ class EngineConfig(EngineArgs):
 @dataclass
 class Policy(PolicyInterface):
     engine_config: EngineConfig | Mapping = field(default_factory=EngineConfig)
-    sampling_config: SamplingConfig | Mapping = field(default_factory=SamplingConfig)
-    use_vllm_builtin_load: bool = True
     available_devices: str | None = None
     use_dcp: bool = True
     # Gets set up by setup
-    sampling_params: SamplingParams | None = None
     lora_request: LoRARequest | None = None
     tokenization_kwargs: dict = field(default_factory=dict)
     policy_worker: "PolicyWorker" = None
@@ -152,16 +95,12 @@ class Policy(PolicyInterface):
         self.running = False
         if isinstance(self.engine_config, Mapping):
             self.engine_config = EngineConfig.from_dict(self.engine_config)
-        if isinstance(self.sampling_config, Mapping):
-            self.sampling_config = SamplingConfig.from_dict(self.sampling_config)
-        # No conversion needed for boolean flag
 
     @classmethod
     async def launch(  # pyright: ignore[reportIncompatibleMethodOverride]
         cls: type["Policy"],
         *,
         engine_config: EngineConfig | Mapping = EngineConfig(),
-        sampling_config: SamplingConfig | Mapping = SamplingConfig(),
         available_devices: str | None = None,
         use_dcp: bool = True,
         **kwargs,
@@ -196,16 +135,12 @@ class Policy(PolicyInterface):
             "vllm_worker", PolicyWorker, vllm_config=vllm_config, use_dcp=use_dcp
         )
 
-        if isinstance(sampling_config, Mapping):
-            sampling_config = SamplingConfig(**sampling_config)
-
         # TODO - expand support so name can stick within kwargs
         actor_name = kwargs.pop("name", cls.__name__)
         policy = policy_proc.spawn(
             actor_name,
             cls,
             engine_config=engine_config,
-            sampling_config=sampling_config,
             available_devices=available_devices,
             policy_worker=workers,
             **kwargs,
@@ -252,11 +187,6 @@ class Policy(PolicyInterface):
 
         self.vllm_config: VllmConfig = self.engine_config.create_vllm_config()
 
-        # Setup sampling params
-        self.sampling_params = get_default_sampling_params(
-            self.vllm_config, overrides=asdict(self.sampling_config)
-        )
-
         # Setup processors
         # TODO: move all processing to the Environment
         # TODO: add support for `log_stats` and `mm_registry`
@@ -293,43 +223,40 @@ class Policy(PolicyInterface):
             self._run_task = asyncio.create_task(self.run())
 
     @endpoint
-    async def generate(self, prompt: str, priority: int = 0) -> list[Completion]:
-        """Generate a response for the given prompt
+    async def generate(
+        self, prompt: str, sampling_params: SamplingParams, *, priority: int = 0
+    ) -> list[Completion]:
+        """Generate n response(s) for a given prompt where n is determined by the sampling params.
 
         Args:
-            prompt (str): The prompt to generate a response for.
+            prompt (str): The prompt for which to generate responses.
+            sampling_params (SamplingParams): The sampling params to use for generating responses.
             priority (int, optional): The priority of the request. Defaults to 0.
 
         Returns:
-            RequestOutput: vLLM class with the generated response.
+            list[Completion]: Generated responses.
         """
         t = Tracer("policy_perf/generate", timer="gpu")
         t.start()
-
         record_metric("policy/generate/count_requests", 1, Reduce.SUM)
 
         self.request_id += 1 % sys.maxsize
         request_id = str(self.request_id)  # implement from a counter
 
-        # Wraps prompt into a dict
-        prompt_dict: dict[str, str] = convert_input(prompt=prompt)
+        if tokenization_kwargs is None:
+            tokenization_kwargs = {}
+            truncate_prompt_tokens = sampling_params.truncate_prompt_tokens
+            _validate_truncation_size(
+                self.vllm_config.model_config.max_model_len,
+                truncate_prompt_tokens,
+                tokenization_kwargs,
+            )
 
-        # truncate prmpt
-        tokenization_kwargs = self.tokenization_kwargs or {}
-        # TODO: add truncation support https://github.com/vllm-project/vllm/issues/4507
-        truncate_prompt_tokens = self.sampling_params.truncate_prompt_tokens
-        _validate_truncation_size(
-            self.vllm_config.model_config.max_model_len,
-            truncate_prompt_tokens,
-            tokenization_kwargs,
-        )
-        t.step("prompt_truncation")
-
-        # process and tokenize prompt
+        # Tokenize prompt, create a request
         prompt_str, request = self.processor.process_inputs(
             request_id=request_id,
-            prompt=prompt_dict,
-            params=self.sampling_params,
+            prompt={"prompt": prompt},
+            params=sampling_params,
             arrival_time=None,
             lora_request=self.lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -342,18 +269,17 @@ class Policy(PolicyInterface):
         # Wait until we're accepting requests (releases lock while waiting)
         # If accepting_requests is True, continue immediately (holding the lock)
         # If False, release lock, wait for notification, re-acquire and recheck
+        num_samples = sampling_params.n
         async with self.request_lock:
             await self.request_lock.wait_for(lambda: self.accepting_requests)
 
-            # Explicitly keeping the redundant logic to make it easier to pick up
-            # vllm changes
+            # Keeping the redundant logic to make it easier to pick up vLLM changes
             # TODO: Clean up before release
-            if (num_samples := self.sampling_params.n) == 1:
+            if num_samples == 1:
                 self.output_processor.add_request(request, prompt_str, None, 0)
-                request, _ = self.preprocess_add_request(request)
+                request, _ = self._preprocess_add_request(request)
                 request_fut = asyncio.Future()
                 self.requests[request_id] = (None, request_fut)
-
                 self.scheduler.add_request(request)
             else:
                 parent_req = ParentRequest(request_id, self.sampling_params)
@@ -368,7 +294,6 @@ class Policy(PolicyInterface):
                         child_request, prompt_str, parent_req, idx
                     )
                     child_request, _ = self.preprocess_add_request(child_request)
-
                     self.scheduler.add_request(child_request)
                 request_fut = asyncio.Future()
                 self.requests[request_id] = (parent_req, request_fut)
@@ -400,16 +325,18 @@ class Policy(PolicyInterface):
 
         return completions
 
-    # Abstracted to match vllm
-    # https://github.com/vllm-project/vllm/blob/0e3bb543f064eb416bca4f6f3013efa3830b12f7/vllm/v1/engine/core.py#L419
-    def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
-        if request.mm_hashes is not None:
+    def _preprocess_add_request(
+        self, eng_core_request: EngineCoreRequest
+    ) -> tuple[Request, int]:
+        """Abstracted to match vllm
+        https://github.com/vllm-project/vllm/blob/0e3bb543f064eb416bca4f6f3013efa3830b12f7/vllm/v1/engine/core.py#L419
+        """
+        if eng_core_request.mm_hashes is not None:
             raise NotImplementedError("Support for mm_hash is not implemented yet.")
-        request: Request = Request.from_engine_core_request(request)
+        request: Request = Request.from_engine_core_request(eng_core_request)
         if request.use_structured_output:
             self.scheduler.structured_output_manager.grammar_init(request)
-
-        return request, 0  # Unused Arg: Current Wave
+        return request, 0  # Second return value is not used
 
     async def run(self):
         # TODO: add support for `iteration_stats`
@@ -492,18 +419,6 @@ class Policy(PolicyInterface):
             self.accepting_requests = True
             self.request_lock.notify_all()
 
-        logger.info(f"Weight update completed (now v{self.policy_version})")
-
-    @endpoint
-    async def update_weights_DEPRECATED(self, policy_version: int):  # noqa: N802
-        # TODO: If generating long sequences, this might be long and will block policy weight updates
-        curr_requests = [fut for _, fut in self.requests.values()]
-        if curr_requests:
-            logger.debug(f"Waiting for {len(curr_requests)} pending requests")
-            await asyncio.gather(*curr_requests)
-
-        await self.policy_worker.update_DEPRECATED.call(version=policy_version)
-        self.policy_version = policy_version
         logger.info(f"Weight update completed (now v{self.policy_version})")
 
     @endpoint
@@ -750,21 +665,14 @@ class PolicyWorker(ForgeActor):
         return worker
 
 
-def convert_input(prompt=None, prompt_token_ids=None) -> dict:
-    assert (prompt is None) ^ (prompt_token_ids is None)
-    if prompt is not None:
-        return {"prompt": prompt}
-    return {"prompt_token_ids": prompt_token_ids}
-
-
-def get_default_sampling_params(vllm_config, overrides=None) -> SamplingParams:
-    default_params = vllm_config.model_config.get_diff_sampling_param()
-    if overrides is not None:
-        default_params |= overrides
-    if default_params:
-        params = SamplingParams.from_optional(**default_params)
-    else:
-        params = SamplingParams()
-    # We only care about the final output
-    params.output_kind = RequestOutputKind.FINAL_ONLY
-    return params
+# def get_default_sampling_params(vllm_config, overrides=None) -> SamplingParams:
+#     default_params = vllm_config.model_config.get_diff_sampling_param()
+#     if overrides is not None:
+#         default_params |= overrides
+#     if default_params:
+#         params = SamplingParams.from_optional(**default_params)
+#     else:
+#         params = SamplingParams()
+#     # We only care about the final output
+#     params.output_kind = RequestOutputKind.FINAL_ONLY
+#     return params

@@ -7,11 +7,12 @@
 from abc import ABC, abstractmethod
 from typing import Any, Mapping
 
-from monarch.actor import endpoint
-
 from forge.controller import ForgeActor
+from forge.data_models.completion import Completion
 
-from forge.types import Action, Message, Observation, Scalar, State
+from forge.types import Message, Observation, Scalar, State
+
+from monarch.actor import endpoint
 
 
 class Transform(ABC):
@@ -79,7 +80,7 @@ class Policy(ForgeActor, ABC):
 
     @endpoint
     @abstractmethod
-    async def generate(self, request: Observation) -> Action:
+    async def generate(self, prompt: str, sampling_params: Any) -> list[Completion]:
         """Generate an action given a state/request."""
         pass
 
