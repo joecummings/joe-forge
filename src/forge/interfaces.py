@@ -7,12 +7,12 @@
 from abc import ABC, abstractmethod
 from typing import Any, Mapping
 
+from monarch.actor import endpoint
+
 from forge.controller import ForgeActor
 from forge.data_models.completion import Completion
 
 from forge.types import Message, Observation, Scalar, State
-
-from monarch.actor import endpoint
 
 
 class Transform(ABC):

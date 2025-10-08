@@ -42,6 +42,23 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.worker.worker_base import WorkerWrapperBase
 
+from forge.actors._torchstore_utils import (
+    extract_param_name,
+    get_dcp_whole_state_dict_key,
+    get_param_key,
+    get_param_prefix,
+    load_tensor_from_dcp,
+)
+
+from forge.controller import ForgeActor, get_proc_mesh, stop_proc_mesh
+from forge.data.sharding import VLLMSharding
+from forge.data_models.completion import Completion
+from forge.data_models.prompt import to_prompt
+from forge.interfaces import Policy as PolicyInterface
+from forge.observability.metrics import record_metric, Reduce
+from forge.observability.perf_tracker import Tracer
+from forge.types import ProcessConfig
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -221,21 +238,12 @@ class Policy(PolicyInterface):
         self.requests: dict[str, tuple[None | ParentRequest, asyncio.Future]] = {}
 
         # TODO: Investigate whether this can be combined with `policy.running`
-        # Whether this policy is accepting requests.
         self.accepting_requests = True
-        # Guard for accepting_requests
-        self.request_lock = asyncio.Condition()
-        # Guard for updating requests
-        self.update_lock = asyncio.Condition()
+        self.request_lock = asyncio.Condition()  # Guard for accepting_requests
+        self.update_lock = asyncio.Condition()  # Guard for updating requests
 
         self.vllm_config: VllmConfig = self.engine_config.create_vllm_config()
 
-        # Setup sampling params
-        self.sampling_params = get_default_sampling_params(
-            self.vllm_config, overrides=self.sampling_config.asdict()
-        )
-
-        # Setup processors
         # TODO: move all processing to the Environment
         # TODO: add support for `log_stats` and `mm_registry`
         tokenizer = init_tokenizer_from_configs(
@@ -243,9 +251,9 @@ class Policy(PolicyInterface):
             scheduler_config=self.vllm_config.scheduler_config,
             lora_config=self.vllm_config.lora_config,
         )
-        self.processor = Processor(
-            vllm_config=self.vllm_config, tokenizer=tokenizer, mm_registry=None
-        )
+        # Processor (convert Inputs --> EngineCoreRequests)
+        self.processor = Processor(self.vllm_config, mm_registry=None)
+        # OutputProcessor (converts EngineCoreOutputs --> RequestOutput)
         self.output_processor = OutputProcessor(tokenizer, log_stats=None)
 
         # Setup scheduler
@@ -289,7 +297,7 @@ class Policy(PolicyInterface):
         record_metric("policy/generate/count_requests", 1, Reduce.SUM)
 
         self.request_id += 1 % sys.maxsize
-        request_id = str(self.request_id)  # implement from a counter
+        request_id = str(self.request_id)  # Implement from a counter
 
         if tokenization_kwargs is None:
             tokenization_kwargs = {}
@@ -317,25 +325,28 @@ class Policy(PolicyInterface):
         # Wait until we're accepting requests (releases lock while waiting)
         # If accepting_requests is True, continue immediately (holding the lock)
         # If False, release lock, wait for notification, re-acquire and recheck
-        num_samples = sampling_params.n
         async with self.request_lock:
             await self.request_lock.wait_for(lambda: self.accepting_requests)
-
             # Keeping the redundant logic to make it easier to pick up vLLM changes
-            # TODO: Clean up before release
-            if num_samples == 1:
+            if sampling_params.n == 1:
                 self.output_processor.add_request(request, prompt_str, None, 0)
                 request, _ = self._preprocess_add_request(request)
                 request_fut = asyncio.Future()
                 self.requests[request_id] = (None, request_fut)
                 self.scheduler.add_request(request)
             else:
+                # Get the updated SamplingParams from the request, which
+                # were cloned/updated in processor.process_inputs above.
+                parent_params = request.sampling_params
+                assert parent_params is not None
                 parent_req = ParentRequest(request_id, self.sampling_params)
-                for idx in range(num_samples):
+                for idx in range(parent_params.n):
                     # Note: `get_child_info` mutates ParentRequest to track the
                     # generated child request
                     child_request_id, params = parent_req.get_child_info(idx)
-                    child_request = request if idx == num_samples - 1 else copy(request)
+                    child_request = (
+                        request if idx == parent_params.n - 1 else copy(request)
+                    )
                     child_request.request_id = child_request_id
                     child_request.sampling_params = params
                     self.output_processor.add_request(
@@ -348,12 +359,7 @@ class Policy(PolicyInterface):
 
         completions = await request_fut
         t.step("generate")
-
-        record_metric(
-            "policy/generate/count_sequences_completed",
-            len(completions),
-            Reduce.SUM,
-        )
+        t.stop()
 
         for completion in completions:
             num_generated_tokens = len(completion.token_ids)
@@ -362,14 +368,11 @@ class Policy(PolicyInterface):
                 num_generated_tokens,
                 Reduce.SUM,
             )
-
             record_metric(
                 "policy/generate/avg_tokens_generated",
                 num_generated_tokens,
                 Reduce.MEAN,
             )
-
-        t.stop()
 
         return completions
 
@@ -391,13 +394,10 @@ class Policy(PolicyInterface):
         # TODO: move postprocessing out of loop to not block
         self.running = True
         while self.running:
-
             scheduler_output = self.scheduler.schedule()
-
             worker_outputs = await self.policy_worker.execute_model.call(
                 scheduler_output
             )
-
             # the results of `execute_model` is gathered on the driver rank (rank 0)
             _, worker_output = next(worker_outputs.items())
             outputs = self.scheduler.update_from_output(scheduler_output, worker_output)
@@ -409,7 +409,6 @@ class Policy(PolicyInterface):
                 engine_core_timestamp=outputs.timestamp,
                 iteration_stats=None,
             )
-
             for request_output in processed_outputs.request_outputs:
                 if request_output.finished:
                     completions = self._to_completions(request_output)
@@ -422,13 +421,12 @@ class Policy(PolicyInterface):
                     self.request_lock.notify_all()
 
     @endpoint
-    async def update_weights(self, policy_version: int):
+    async def update_weights(self, policy_version: int) -> None:
         # Serialize updates (only one update at a time)
         async with self.update_lock:
             # Grab the lock to stop accepting requests and wait on pending requests
             async with self.request_lock:
                 self.accepting_requests = False
-
                 curr_requests = [fut for _, fut in self.requests.values()]
                 if curr_requests:
                     # Record pending requests metrics
@@ -451,12 +449,8 @@ class Policy(PolicyInterface):
 
             # Record weight update metrics
             record_metric("policy/update_weights/count_weight_updates", 1, Reduce.SUM)
-
             logger.debug(f"Starting weight update on {self.__class__.__name__}")
-            if self.use_vllm_builtin_load:
-                await self.policy_worker.update.call(version=policy_version)
-            else:
-                await self.policy_worker.update_DEPRECATED.call(version=policy_version)
+            await self.policy_worker.update.call(version=policy_version)
             self.policy_version = policy_version
 
             # After updating the weights, we need to reset the KV cache
@@ -470,24 +464,11 @@ class Policy(PolicyInterface):
         logger.info(f"Weight update completed (now v{self.policy_version})")
 
     @endpoint
-    async def _reset_prefix_cache(self):
+    async def _reset_prefix_cache(self) -> None:
         self.scheduler.reset_prefix_cache()
 
     @endpoint
-    async def update_weights_DEPRECATED(self, policy_version: int):  # noqa: N802
-        # TODO: If generating long sequences, this might be long and will block policy weight updates
-        curr_requests = [fut for _, fut in self.requests.values()]
-        if curr_requests:
-            logger.debug(f"Waiting for {len(curr_requests)} pending requests")
-            await asyncio.gather(*curr_requests)
-
-        await self.policy_worker.update_DEPRECATED.call(version=policy_version)
-        self.policy_version = policy_version
-        logger.info(f"Weight update completed (now v{self.policy_version})")
-
-    @endpoint
     async def get_version(self) -> int:
-        """Get the current policy version."""
         return self.policy_version
 
     @endpoint
@@ -526,20 +507,14 @@ class Policy(PolicyInterface):
                     metadata={"num_cached_tokens": request_output.num_cached_tokens},
                 )
             )
-
         return completions
 
-    def _extract_logprobs(self, one_sample: CompletionOutput) -> torch.Tensor | None:
-        """
-        Extract log probabilities from a sample, if available.
-        """
-        if one_sample.logprobs is not None:
+    def _extract_logprobs(self, sample: CompletionOutput) -> torch.Tensor | None:
+        if sample.logprobs is not None:
             return torch.tensor(
                 [
                     top_k_dict[token].logprob
-                    for token, top_k_dict in zip(
-                        one_sample.token_ids, one_sample.logprobs
-                    )
+                    for token, top_k_dict in zip(sample.token_ids, sample.logprobs)
                 ]
             )
         return None
@@ -606,19 +581,6 @@ class PolicyWorker(ForgeActor):
             )
 
     @endpoint
-    async def update_DEPRECATED(self, version: int):  # noqa: N802
-        """Update model weights by reading state dict from torchstore.
-        Deprecated. This uses manual sharding logic which is buggy."""
-        key = f"{self.state_dict_key}{DELIM}{version}"
-        model = self.worker.model_runner.model
-        current_state_dict = model.state_dict()
-        start = time.perf_counter()
-        await self._load_tensor_parallel_state_dict(current_state_dict, version)
-        logger.info(
-            f"Loaded state dict from {key} in {time.perf_counter() - start} seconds"
-        )
-
-    @endpoint
     async def update(self, version: int):
         """Update model weights by reading state dict from torchstore"""
         logger.info(
@@ -660,9 +622,7 @@ class PolicyWorker(ForgeActor):
 
     @endpoint
     async def setup_kv_cache(self):
-        """Based on vllm/v1/engine/core.py:EngineCore._initialize_kv_caches
-        TODO: test that fails if vllm method updates
-        """
+        """Based on vllm/v1/engine/core.py:EngineCore._initialize_kv_caches"""
         kv_cache_spec = self.worker.get_kv_cache_spec()
         if kv_cache_spec is not None:
             available_gpu_memory = self.worker.determine_available_memory()
@@ -728,16 +688,3 @@ class PolicyWorker(ForgeActor):
         worker.init_device()
         worker.load_model()
         return worker
-
-
-# def get_default_sampling_params(vllm_config, overrides=None) -> SamplingParams:
-#     default_params = vllm_config.model_config.get_diff_sampling_param()
-#     if overrides is not None:
-#         default_params |= overrides
-#     if default_params:
-#         params = SamplingParams.from_optional(**default_params)
-#     else:
-#         params = SamplingParams()
-#     # We only care about the final output
-#     params.output_kind = RequestOutputKind.FINAL_ONLY
-#     return params
