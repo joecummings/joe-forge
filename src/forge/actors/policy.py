@@ -145,7 +145,7 @@ class Policy(PolicyInterface):
     lora_request: LoRARequest | None = None
     tokenization_kwargs: dict = field(default_factory=dict)
     policy_worker: "PolicyWorker" = None
-    policy_version: int | None = None
+    policy_version: int = 0
 
     def __post_init__(self):
         super().__init__()
@@ -234,13 +234,12 @@ class Policy(PolicyInterface):
         await self.policy_worker.setup.call()
 
         self.request_id = 0
-        self.policy_version = 0
         self.requests: dict[str, tuple[None | ParentRequest, asyncio.Future]] = {}
 
         # TODO: Investigate whether this can be combined with `policy.running`
         self.accepting_requests = True
-        self.request_lock = asyncio.Condition()  # Guard for accepting_requests
-        self.update_lock = asyncio.Condition()  # Guard for updating requests
+        self.request_lock = asyncio.Condition()  # Guard for accepting requests
+        self.update_lock = asyncio.Condition()  # Guard for updating weights
 
         self.vllm_config: VllmConfig = self.engine_config.create_vllm_config()
 
@@ -262,13 +261,12 @@ class Policy(PolicyInterface):
         _, kv_cache_config = next(kv_cache_configs.items())
         self.vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.vllm_config.cache_config.num_cpu_blocks = 0
-
         structured_output_manager = StructuredOutputManager(self.vllm_config)
         self.scheduler = Scheduler(
             vllm_config=self.vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=structured_output_manager,
-            include_finished_set=False,
+            include_finished_set=False,  # This depends on data parallel size
             log_stats=None,
         )
         self.start_processing()
@@ -474,18 +472,6 @@ class Policy(PolicyInterface):
     @endpoint
     async def stop(self):
         self.running = False
-
-    @endpoint
-    async def _test_save_model_params(self):
-        """Save model parameters before weight update, used for tesing purposes only."""
-        logger.info("[Policy] save model parameters for testing.")
-        await self.policy_worker._test_save_model_params.call()
-
-    @endpoint
-    async def _test_validate_model_params(self, validate_fn):
-        """Validate updated model params using validate_fn."""
-        logger.info("[Policy] start validating model parameters.")
-        return await self.policy_worker._test_validate_model_params.call(validate_fn)
 
     def _to_completions(self, request_output: RequestOutput) -> list[Completion]:
         """Convert a RequestOutput to a list of Completion objects."""
