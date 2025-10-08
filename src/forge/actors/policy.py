@@ -47,6 +47,49 @@ logger.setLevel(logging.INFO)
 
 
 @dataclass
+class SamplingConfig:
+    """
+    Overrides for vLLMs sampling params.
+
+    Note: We'll want to tie this closer to or directly use vllm's
+            SamplingParams. It is currently used to track a supported
+            subset
+
+    Args:
+        n: Number of samples to generate.
+        guided_decoding: Whether to use guided decoding.
+        max_tokens: Maximum number of tokens to generate.
+    """
+
+    n: int = 1
+    guided_decoding: bool = False
+    max_tokens: int = 512
+    temperature: float = 1.0
+    top_p: float = 1.0
+    logprobs: int = 1
+
+    def __post_init__(self):
+        super().__init__()
+        gd_params = None
+        if self.guided_decoding:
+            gd_params = GuidedDecodingParams(choice=["Positive", "Negative"])
+        self.guided_decoding = gd_params
+
+    @classmethod
+    def from_dict(cls, d: Mapping):
+        d = dict(d)
+        all_fields = set(cls.__dataclass_fields__.keys())
+        valid_args = {k: v for k, v in d.items() if k in all_fields}
+        return cls(**valid_args)
+
+    def asdict(self):
+        # Use the full object instead of a Dict
+        ret = asdict(self)
+        ret["guided_decoding"] = self.guided_decoding
+        return ret
+
+
+@dataclass
 class EngineConfig(EngineArgs):
     """
     EngineConfig extends EngineArgs with worker-specific fields.
@@ -186,6 +229,11 @@ class Policy(PolicyInterface):
         self.update_lock = asyncio.Condition()
 
         self.vllm_config: VllmConfig = self.engine_config.create_vllm_config()
+
+        # Setup sampling params
+        self.sampling_params = get_default_sampling_params(
+            self.vllm_config, overrides=self.sampling_config.asdict()
+        )
 
         # Setup processors
         # TODO: move all processing to the Environment
@@ -412,13 +460,29 @@ class Policy(PolicyInterface):
             self.policy_version = policy_version
 
             # After updating the weights, we need to reset the KV cache
-            self.scheduler.kv_cache_manager.reset_prefix_cache()
+            self.scheduler.reset_prefix_cache()
 
         # Resume accepting requests and wake up any waiting generate() calls
         async with self.request_lock:
             self.accepting_requests = True
             self.request_lock.notify_all()
 
+        logger.info(f"Weight update completed (now v{self.policy_version})")
+
+    @endpoint
+    async def _reset_prefix_cache(self):
+        self.scheduler.reset_prefix_cache()
+
+    @endpoint
+    async def update_weights_DEPRECATED(self, policy_version: int):  # noqa: N802
+        # TODO: If generating long sequences, this might be long and will block policy weight updates
+        curr_requests = [fut for _, fut in self.requests.values()]
+        if curr_requests:
+            logger.debug(f"Waiting for {len(curr_requests)} pending requests")
+            await asyncio.gather(*curr_requests)
+
+        await self.policy_worker.update_DEPRECATED.call(version=policy_version)
+        self.policy_version = policy_version
         logger.info(f"Weight update completed (now v{self.policy_version})")
 
     @endpoint
@@ -459,6 +523,7 @@ class Policy(PolicyInterface):
                     token_ids=torch.tensor(output.token_ids),
                     logprobs=self._extract_logprobs(output),
                     generator_version=self.policy_version,
+                    metadata={"num_cached_tokens": request_output.num_cached_tokens},
                 )
             )
 
